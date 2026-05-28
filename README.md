@@ -87,10 +87,10 @@ python scripts/setvq_report.py `
 python scripts/setvq_export_codes.py `
   --index data\canopus_hplus_50k_units.jsonl `
   --checkpoint runs\canopus_setvq_formula_k256\best_model.pt `
-  --out runs\canopus_setvq_formula_k256\setvq_code_histograms.npz
+  --out runs\canopus_setvq_formula_k256\setvq_codes.npz
 
 python scripts/vq_probe.py `
-  --features runs\canopus_setvq_formula_k256\setvq_code_histograms.npz `
+  --features runs\canopus_setvq_formula_k256\setvq_codes.npz `
   --index data\canopus_hplus_50k_units.jsonl `
   --out-dir runs\canopus_setvq_formula_k256\probe
 ```
@@ -103,9 +103,13 @@ For a smoke run:
 ```powershell
 python scripts/setvq_train.py --index data\smoke_units.jsonl --out-dir runs\smoke_setvq --epochs 1 --batch-size 8 --hidden-dim 32 --code-dim 8 --codebook-size 16 --num-slots 4 --encoder-layers 1 --decoder-layers 2 --max-peaks 32 --max-mz 300 --bin-width 1
 python scripts/setvq_report.py --index data\smoke_units.jsonl --checkpoint runs\smoke_setvq\best_model.pt --out-dir runs\smoke_setvq\report --max-spectra 40 --batch-size 8
-python scripts/setvq_export_codes.py --index data\smoke_units.jsonl --checkpoint runs\smoke_setvq\best_model.pt --out runs\smoke_setvq\setvq_code_histograms.npz --batch-size 8
-python scripts/vq_probe.py --features runs\smoke_setvq\setvq_code_histograms.npz --index data\smoke_units.jsonl --out-dir runs\smoke_setvq\probe --epochs 1 --batch-size 16 --top-losses 16 --top-fragments 16 --max-spectra 40 --device cpu
+python scripts/setvq_export_codes.py --index data\smoke_units.jsonl --checkpoint runs\smoke_setvq\best_model.pt --out runs\smoke_setvq\setvq_codes.npz --batch-size 8
+python scripts/vq_probe.py --features runs\smoke_setvq\setvq_codes.npz --index data\smoke_units.jsonl --out-dir runs\smoke_setvq\probe --epochs 1 --batch-size 16 --top-losses 16 --top-fragments 16 --max-spectra 40 --device cpu
 ```
+
+`setvq_codes.npz` contains both `vq_sequence` with shape
+`[num_spectra, num_slots]` for sequence-style decoder experiments and
+`vq_histogram` with shape `[num_spectra, codebook_size]` for linear probes.
 
 ## Verification
 
@@ -121,4 +125,4 @@ python -m pytest
 - `runs/*/report/report.md`: human-readable tokenizer report.
 - `runs/*/vq_code_histograms.npz`: per-spectrum features laid out as `peak_hist | fragment_hist | event_hist`.
 - `runs/*/probe/probe_report.md`: linear-probe representation benchmark.
-- `runs/*/setvq_code_histograms.npz`: observation-only SetVQ slot-code histograms.
+- `runs/*/setvq_codes.npz`: SetVQ slot-code sequences plus histogram features.

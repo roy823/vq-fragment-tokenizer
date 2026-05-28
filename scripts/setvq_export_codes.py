@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Export per-spectrum SetVQ slot-code histograms for downstream probes."""
+"""Export per-spectrum SetVQ slot-code sequences and histograms."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--index", default="data/canopus_hplus_peak_units.jsonl")
     parser.add_argument("--checkpoint", default="runs/canopus_setvq_obs/best_model.pt")
-    parser.add_argument("--out", default="runs/canopus_setvq_obs/setvq_code_histograms.npz")
+    parser.add_argument("--out", default="runs/canopus_setvq_obs/setvq_codes.npz")
     parser.add_argument("--max-spectra", type=int, default=None)
     parser.add_argument("--max-units", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=256)
@@ -64,6 +64,7 @@ def main() -> None:
 
     names = []
     features = []
+    sequences = []
     with torch.no_grad():
         for batch in loader:
             tensor_batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
@@ -71,19 +72,29 @@ def main() -> None:
             codes = outputs["slot_codes"].detach().cpu().numpy()
             for spec_id, row_codes in zip(batch["spectrum_id"], codes):
                 names.append(spec_id)
+                sequences.append(row_codes.astype(np.int64, copy=False))
                 features.append(code_histogram(row_codes, model.codebook_size))
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     feature_arr = np.stack(features, axis=0) if features else np.zeros((0, model.codebook_size), dtype=np.float32)
+    sequence_arr = np.stack(sequences, axis=0) if sequences else np.zeros((0, model.num_slots), dtype=np.int64)
     name_arr = np.asarray(names, dtype=object)
-    np.savez_compressed(out, spectrum_id=name_arr, vq_histogram=feature_arr)
+    np.savez_compressed(
+        out,
+        spectrum_id=name_arr,
+        vq_histogram=feature_arr,
+        vq_sequence=sequence_arr,
+        slot_codes=sequence_arr,
+    )
     meta = {
         "checkpoint": str(args.checkpoint),
         "index": str(args.index),
         "num_spectra": int(len(names)),
         "feature_dim": int(feature_arr.shape[1]),
-        "layout": "setvq_slot_hist",
+        "sequence_shape": list(sequence_arr.shape),
+        "histogram_shape": list(feature_arr.shape),
+        "layout": "vq_sequence [num_spectra,num_slots] | vq_histogram [num_spectra,codebook_size]",
         "codebook_size": int(model.codebook_size),
         "num_slots": int(model.num_slots),
         "formula_conditioned": bool(model.formula_conditioned),
