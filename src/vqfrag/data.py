@@ -457,3 +457,173 @@ def group_units_by_spectrum(units: Iterable[FragmentSpectrumUnit]) -> dict[str, 
     for unit in units:
         grouped[unit.spectrum_id].append(unit)
     return grouped
+
+
+@dataclass(frozen=True)
+class SpectrumSetRecord:
+    """Observation-only spectrum record aggregated by ``spectrum_id``."""
+
+    spectrum_id: str
+    adduct: str
+    collision_energy: float | None
+    instrument: str | None
+    peaks: tuple[tuple[float, float], ...]
+
+
+@dataclass(frozen=True)
+class SpectrumFeatureConfig:
+    max_peaks: int = 256
+    max_mz: float = 1500.0
+    bin_width: float = 1.0
+    mz_scale: float = 1500.0
+    ce_scale: float = 100.0
+
+    @property
+    def num_bins(self) -> int:
+        return int(np.floor(self.max_mz / self.bin_width)) + 1
+
+
+def read_spectrum_set_records(
+    path: str | Path,
+    *,
+    max_spectra: int | None = None,
+    max_units: int | None = None,
+) -> list[SpectrumSetRecord]:
+    """Read a JSONL index and aggregate rows into observation-only spectra."""
+
+    meta: dict[str, dict] = {}
+    peaks: dict[str, list[tuple[float, float]]] = defaultdict(list)
+    units_seen = 0
+    with Path(path).open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            data = json.loads(line)
+            spec_id = str(data["spectrum_id"])
+            if spec_id not in meta:
+                if max_spectra is not None and len(meta) >= max_spectra:
+                    continue
+                meta[spec_id] = {
+                    "adduct": str(data.get("adduct") or ""),
+                    "collision_energy": data.get("collision_energy"),
+                    "instrument": data.get("instrument"),
+                }
+            if spec_id not in meta:
+                continue
+            peaks[spec_id].append((float(data["mz"]), float(data["intensity"])))
+            units_seen += 1
+            if max_units is not None and units_seen >= max_units:
+                break
+
+    records = []
+    for spec_id in sorted(meta):
+        spec_peaks = tuple(sorted(peaks.get(spec_id, ()), key=lambda item: (-item[1], item[0])))
+        if not spec_peaks:
+            continue
+        ce_raw = meta[spec_id]["collision_energy"]
+        records.append(
+            SpectrumSetRecord(
+                spectrum_id=spec_id,
+                adduct=normalize_ion(meta[spec_id]["adduct"]) or "",
+                collision_energy=None if ce_raw is None else float(ce_raw),
+                instrument=meta[spec_id]["instrument"],
+                peaks=spec_peaks,
+            )
+        )
+    return records
+
+
+def bin_peaks(
+    peaks: Sequence[tuple[float, float]],
+    config: SpectrumFeatureConfig = SpectrumFeatureConfig(),
+) -> tuple[np.ndarray, np.ndarray]:
+    """Convert peaks to binned presence and max-intensity targets."""
+
+    presence = np.zeros(config.num_bins, dtype=np.float32)
+    intensity = np.zeros(config.num_bins, dtype=np.float32)
+    for mz, inten in peaks:
+        if 0 <= mz <= config.max_mz:
+            idx = min(int(round(float(mz) / config.bin_width)), config.num_bins - 1)
+            presence[idx] = 1.0
+            intensity[idx] = max(float(intensity[idx]), float(inten))
+    return presence, intensity
+
+
+def spectrum_to_features(
+    record: SpectrumSetRecord,
+    config: SpectrumFeatureConfig = SpectrumFeatureConfig(),
+) -> dict[str, np.ndarray]:
+    """Map one whole-spectrum record to observation-only SetVQ features."""
+
+    selected = list(record.peaks[: config.max_peaks])
+    peak_x = np.zeros((config.max_peaks, 3), dtype=np.float32)
+    peak_mask = np.zeros(config.max_peaks, dtype=np.bool_)
+    ce_norm = 0.0 if record.collision_energy is None else float(record.collision_energy) / config.ce_scale
+    for idx, (mz, inten) in enumerate(selected):
+        peak_x[idx] = np.array([float(mz) / config.mz_scale, float(inten), ce_norm], dtype=np.float32)
+        peak_mask[idx] = True
+
+    adduct_idx = ION_TO_INDEX.get(record.adduct, -1)
+    inst_idx = INSTRUMENT_TYPES.index(_instrument_bucket(record.instrument))
+    cond_x = np.concatenate(
+        [
+            _one_hot(adduct_idx, len(ION_ORDER)),
+            _one_hot(inst_idx, len(INSTRUMENT_TYPES)),
+        ]
+    ).astype(np.float32)
+    target_presence, target_intensity = bin_peaks(selected, config)
+    return {
+        "peak_x": peak_x,
+        "peak_mask": peak_mask,
+        "cond_x": cond_x,
+        "target_presence": target_presence,
+        "target_intensity": target_intensity,
+    }
+
+
+class SpectrumSetDataset(Dataset):
+    """Torch dataset over whole spectra using observation-only inputs."""
+
+    def __init__(
+        self,
+        records_or_path: Sequence[SpectrumSetRecord] | str | Path,
+        *,
+        max_spectra: int | None = None,
+        max_units: int | None = None,
+        feature_config: SpectrumFeatureConfig = SpectrumFeatureConfig(),
+    ) -> None:
+        if isinstance(records_or_path, (str, Path)):
+            self.records = read_spectrum_set_records(
+                records_or_path,
+                max_spectra=max_spectra,
+                max_units=max_units,
+            )
+        else:
+            self.records = list(records_or_path)
+            if max_spectra is not None:
+                self.records = self.records[:max_spectra]
+        self.feature_config = feature_config
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, idx: int) -> dict:
+        record = self.records[idx]
+        feats = spectrum_to_features(record, self.feature_config)
+        return {
+            "peak_x": torch.from_numpy(feats["peak_x"]),
+            "peak_mask": torch.from_numpy(feats["peak_mask"]),
+            "cond_x": torch.from_numpy(feats["cond_x"]),
+            "target_presence": torch.from_numpy(feats["target_presence"]),
+            "target_intensity": torch.from_numpy(feats["target_intensity"]),
+            "spectrum_id": record.spectrum_id,
+            "peaks": record.peaks[: self.feature_config.max_peaks],
+        }
+
+
+def collate_spectrum_sets(batch: list[dict]) -> dict:
+    tensor_keys = ["peak_x", "peak_mask", "cond_x", "target_presence", "target_intensity"]
+    out = {key: torch.stack([item[key] for item in batch], dim=0) for key in tensor_keys}
+    out["spectrum_id"] = [item["spectrum_id"] for item in batch]
+    out["peaks"] = [item["peaks"] for item in batch]
+    return out

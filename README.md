@@ -62,6 +62,47 @@ bin presence. The main question is whether `vq` beats `peak_stats`, and whether
 compressing simple peak statistics rather than learning a useful fragmentation
 vocabulary.
 
+## Observation-Only SetVQ
+
+This is the Step-1 spectrum-level route. It trains only from observed spectrum
+inputs: `mz`, `intensity`, collision energy, adduct condition, and instrument
+condition. Root formula, fragment formula, neutral loss, and m/z error are not
+fed to the model.
+
+```powershell
+python scripts/setvq_train.py `
+  --index data\canopus_hplus_50k_units.jsonl `
+  --out-dir runs\canopus_setvq_obs_k256 `
+  --epochs 10 `
+  --batch-size 128 `
+  --codebook-size 256 `
+  --num-slots 16
+
+python scripts/setvq_report.py `
+  --index data\canopus_hplus_50k_units.jsonl `
+  --checkpoint runs\canopus_setvq_obs_k256\best_model.pt `
+  --out-dir runs\canopus_setvq_obs_k256\report
+
+python scripts/setvq_export_codes.py `
+  --index data\canopus_hplus_50k_units.jsonl `
+  --checkpoint runs\canopus_setvq_obs_k256\best_model.pt `
+  --out runs\canopus_setvq_obs_k256\setvq_code_histograms.npz
+
+python scripts/vq_probe.py `
+  --features runs\canopus_setvq_obs_k256\setvq_code_histograms.npz `
+  --index data\canopus_hplus_50k_units.jsonl `
+  --out-dir runs\canopus_setvq_obs_k256\probe
+```
+
+For a smoke run:
+
+```powershell
+python scripts/setvq_train.py --index data\smoke_units.jsonl --out-dir runs\smoke_setvq --epochs 1 --batch-size 8 --hidden-dim 32 --code-dim 8 --codebook-size 16 --num-slots 4 --encoder-layers 1 --decoder-layers 2 --max-peaks 32 --max-mz 300 --bin-width 1
+python scripts/setvq_report.py --index data\smoke_units.jsonl --checkpoint runs\smoke_setvq\best_model.pt --out-dir runs\smoke_setvq\report --max-spectra 40 --batch-size 8
+python scripts/setvq_export_codes.py --index data\smoke_units.jsonl --checkpoint runs\smoke_setvq\best_model.pt --out runs\smoke_setvq\setvq_code_histograms.npz --batch-size 8
+python scripts/vq_probe.py --features runs\smoke_setvq\setvq_code_histograms.npz --index data\smoke_units.jsonl --out-dir runs\smoke_setvq\probe --epochs 1 --batch-size 16 --top-losses 16 --top-fragments 16 --max-spectra 40 --device cpu
+```
+
 ## Verification
 
 ```powershell
@@ -76,3 +117,4 @@ python -m pytest
 - `runs/*/report/report.md`: human-readable tokenizer report.
 - `runs/*/vq_code_histograms.npz`: per-spectrum features laid out as `peak_hist | fragment_hist | event_hist`.
 - `runs/*/probe/probe_report.md`: linear-probe representation benchmark.
+- `runs/*/setvq_code_histograms.npz`: observation-only SetVQ slot-code histograms.
