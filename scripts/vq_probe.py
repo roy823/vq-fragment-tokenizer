@@ -28,7 +28,7 @@ from torch.utils.data import DataLoader, TensorDataset
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from vqfrag.chem import VALID_ELEMENTS, formula_to_vector
+from vqfrag.chem import NORM_VEC, VALID_ELEMENTS, formula_mass, formula_to_vector, ion_mass_shift, normalize_ion
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,6 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=2048)
     parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--retrieval-max-queries", type=int, default=5000)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     return parser.parse_args()
 
@@ -88,6 +89,7 @@ def collect_targets(
     n_mz_bins = int(math.ceil(max_mz / mz_bin_width)) + 1
 
     root_elements = np.zeros((n, len(VALID_ELEMENTS)), dtype=np.float32)
+    formula_features = np.zeros((n, len(VALID_ELEMENTS) + 3), dtype=np.float32)
     mz_bins = np.zeros((n, n_mz_bins), dtype=np.float32)
     peak_stats_raw = np.zeros((n, 10), dtype=np.float64)
 
@@ -97,6 +99,10 @@ def collect_targets(
     global_fragments: Counter[str] = Counter()
 
     seen_root = np.zeros(n, dtype=bool)
+    root_formula_names = [""] * n
+    parent_mass_by_row = np.zeros(n, dtype=np.float64)
+    precursor_mz_by_row = np.zeros(n, dtype=np.float64)
+    adduct_shift_by_row = np.zeros(n, dtype=np.float64)
     rows_seen = 0
     with Path(index).open("r", encoding="utf-8") as handle:
         for line in handle:
@@ -109,9 +115,24 @@ def collect_targets(
             rows_seen += 1
 
             if not seen_root[row]:
+                root_formula_names[row] = str(rec.get("root_formula") or "")
                 vec = _safe_formula_vec(rec.get("root_formula"))
                 if vec is not None:
                     root_elements[row] = (vec > 0).astype(np.float32)
+                    parent_mass = formula_mass(vec)
+                    adduct = normalize_ion(rec.get("adduct"))
+                    try:
+                        shift = ion_mass_shift(adduct)
+                    except ValueError:
+                        shift = 0.0
+                    precursor_mz = parent_mass + shift
+                    parent_mass_by_row[row] = parent_mass
+                    precursor_mz_by_row[row] = precursor_mz
+                    adduct_shift_by_row[row] = shift
+                    formula_features[row, : len(VALID_ELEMENTS)] = (vec / NORM_VEC).astype(np.float32)
+                    formula_features[row, len(VALID_ELEMENTS)] = parent_mass / max_mz
+                    formula_features[row, len(VALID_ELEMENTS) + 1] = precursor_mz / max_mz
+                    formula_features[row, len(VALID_ELEMENTS) + 2] = vec.sum() / float(NORM_VEC.sum())
                 seen_root[row] = True
 
             frag = str(rec.get("fragment_formula") or "")
@@ -126,7 +147,8 @@ def collect_targets(
 
             mz = float(rec.get("mz", 0.0))
             intensity = float(rec.get("intensity", 0.0))
-            loss_mass = float(rec.get("neutral_loss_mass", 0.0))
+            neutral_peak_mass = max(mz - adduct_shift_by_row[row], 0.0)
+            loss_mass = max(parent_mass_by_row[row] - neutral_peak_mass, 0.0) if parent_mass_by_row[row] > 0 else 0.0
             if 0 <= mz <= max_mz:
                 mz_bins[row, min(int(round(mz / mz_bin_width)), n_mz_bins - 1)] = 1.0
 
@@ -192,6 +214,8 @@ def collect_targets(
             "fragment_formula": {"y": fragment_labels, "labels": top_fragment_names},
             "mz_bin": {"y": mz_bins, "labels": [f"{i * mz_bin_width:.1f}" for i in range(n_mz_bins)]},
         },
+        "formula_features": formula_features,
+        "root_formula": root_formula_names,
         "peak_stats": peak_stats,
         "rows_seen": rows_seen,
         "missing_root_labels": missing,
@@ -271,6 +295,52 @@ def multilabel_metrics(y_true: np.ndarray, y_score: np.ndarray) -> dict:
         "recall_at_1": topk_recall(y_true, y_score, 1),
         "recall_at_5": topk_recall(y_true, y_score, 5),
         "recall_at_10": topk_recall(y_true, y_score, 10),
+    }
+
+
+def same_formula_retrieval(
+    *,
+    x: np.ndarray,
+    root_formula: list[str],
+    loss_y: np.ndarray,
+    fragment_y: np.ndarray,
+    max_queries: int,
+    seed: int,
+) -> dict:
+    """Nearest-neighbor retrieval within equal-root-formula groups."""
+
+    rng = np.random.default_rng(seed)
+    groups: dict[str, list[int]] = {}
+    for idx, formula in enumerate(root_formula):
+        if formula:
+            groups.setdefault(formula, []).append(idx)
+    query_pool = [idx for values in groups.values() if len(values) > 1 for idx in values]
+    if len(query_pool) > max_queries:
+        query_pool = rng.choice(np.asarray(query_pool), size=max_queries, replace=False).tolist()
+    if not query_pool:
+        return {"queries": 0, "loss_jaccard": float("nan"), "fragment_jaccard": float("nan")}
+
+    x_std = (x - x.mean(axis=0, keepdims=True)) / np.maximum(x.std(axis=0, keepdims=True), 1e-6)
+    x_norm = x_std / np.maximum(np.linalg.norm(x_std, axis=1, keepdims=True), 1e-12)
+    loss_scores = []
+    fragment_scores = []
+    for query in query_pool:
+        candidates = [idx for idx in groups[root_formula[query]] if idx != query]
+        if not candidates:
+            continue
+        sims = x_norm[candidates] @ x_norm[query]
+        nn = candidates[int(np.argmax(sims))]
+        for y, scores in [(loss_y, loss_scores), (fragment_y, fragment_scores)]:
+            a = y[query] > 0
+            b = y[nn] > 0
+            union = np.logical_or(a, b).sum()
+            if union == 0:
+                continue
+            scores.append(float(np.logical_and(a, b).sum() / union))
+    return {
+        "queries": int(len(query_pool)),
+        "loss_jaccard": float(np.mean(loss_scores)) if loss_scores else float("nan"),
+        "fragment_jaccard": float(np.mean(fragment_scores)) if fragment_scores else float("nan"),
     }
 
 
@@ -370,6 +440,24 @@ def write_markdown(results: dict, out_path: Path) -> None:
                     r10=metrics["recall_at_10"],
                 )
             )
+    lines.extend(
+        [
+            "",
+            "## Same-Formula Retrieval",
+            "",
+            "| feature | queries | loss Jaccard | fragment Jaccard |",
+            "| --- | ---: | ---: | ---: |",
+        ]
+    )
+    for feature_name, metrics in results.get("same_formula_retrieval", {}).items():
+        lines.append(
+            "| {feature} | {queries} | {loss:.4f} | {fragment:.4f} |".format(
+                feature=feature_name,
+                queries=metrics["queries"],
+                loss=metrics["loss_jaccard"],
+                fragment=metrics["fragment_jaccard"],
+            )
+        )
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -386,10 +474,15 @@ def main() -> None:
         max_mz=args.max_mz,
     )
     peak_stats = target_bundle["peak_stats"]
+    formula_features = target_bundle["formula_features"]
     feature_sets = {
         "vq": vq_x,
         "peak_stats": peak_stats,
+        "formula_only": formula_features,
+        "formula_peak_stats": np.concatenate([formula_features, peak_stats], axis=1),
+        "formula_vq": np.concatenate([formula_features, vq_x], axis=1),
         "vq_plus_peak_stats": np.concatenate([vq_x, peak_stats], axis=1),
+        "formula_peak_stats_vq": np.concatenate([formula_features, peak_stats, vq_x], axis=1),
     }
     split = make_split(len(names), args.seed)
 
@@ -409,6 +502,23 @@ def main() -> None:
                 device=device,
             )
 
+    retrieval_features = {
+        key: feature_sets[key]
+        for key in ["vq", "peak_stats", "formula_peak_stats", "formula_vq", "formula_peak_stats_vq"]
+        if key in feature_sets
+    }
+    same_formula = {
+        name: same_formula_retrieval(
+            x=np.asarray(x, dtype=np.float32),
+            root_formula=target_bundle["root_formula"],
+            loss_y=np.asarray(target_bundle["targets"]["neutral_loss"]["y"], dtype=np.float32),
+            fragment_y=np.asarray(target_bundle["targets"]["fragment_formula"]["y"], dtype=np.float32),
+            max_queries=args.retrieval_max_queries,
+            seed=args.seed,
+        )
+        for name, x in retrieval_features.items()
+    }
+
     results = {
         "features": str(args.features),
         "index": str(args.index),
@@ -420,6 +530,7 @@ def main() -> None:
         "split_sizes": {key: int(len(value)) for key, value in split.items()},
         "target_labels": {task: list(payload["labels"]) for task, payload in target_bundle["targets"].items()},
         "probes": probes,
+        "same_formula_retrieval": same_formula,
     }
 
     out_dir = Path(args.out_dir)

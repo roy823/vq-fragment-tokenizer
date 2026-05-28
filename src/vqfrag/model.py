@@ -270,13 +270,18 @@ class SetVQEncoderBlock(nn.Module):
 
 
 class SetVQSpectrumTokenizer(nn.Module):
-    """Observation-only SetVQ tokenizer for whole MS/MS spectra."""
+    """SetVQ tokenizer for whole MS/MS spectra.
+
+    By default this is formula-conditioned: root formula-derived features are
+    allowed as global conditions, while fragment/loss labels remain excluded.
+    """
 
     def __init__(
         self,
         *,
-        peak_dim: int = 3,
+        peak_dim: int = 5,
         condition_dim: int = 12,
+        formula_dim: int = 20,
         hidden_dim: int = 128,
         code_dim: int = 64,
         codebook_size: int = 256,
@@ -290,10 +295,14 @@ class SetVQSpectrumTokenizer(nn.Module):
         bce_weight: float = 1.0,
         intensity_weight: float = 1.0,
         cosine_weight: float = 0.5,
+        diversity_weight: float = 0.05,
+        slot_usage_weight: float = 0.05,
+        formula_conditioned: bool = True,
     ) -> None:
         super().__init__()
         self.peak_dim = int(peak_dim)
         self.condition_dim = int(condition_dim)
+        self.formula_dim = int(formula_dim)
         self.hidden_dim = int(hidden_dim)
         self.code_dim = int(code_dim)
         self.codebook_size = int(codebook_size)
@@ -307,8 +316,13 @@ class SetVQSpectrumTokenizer(nn.Module):
         self.bce_weight = float(bce_weight)
         self.intensity_weight = float(intensity_weight)
         self.cosine_weight = float(cosine_weight)
+        self.diversity_weight = float(diversity_weight)
+        self.slot_usage_weight = float(slot_usage_weight)
+        self.formula_conditioned = bool(formula_conditioned)
 
         self.peak_encoder = _mlp(peak_dim, hidden_dim, hidden_dim, 2, dropout, normalize_output=True)
+        self.formula_encoder = _mlp(formula_dim, hidden_dim, hidden_dim, 2, dropout, normalize_output=True)
+        self.formula_slot_bias = nn.Linear(hidden_dim, num_slots * hidden_dim)
         self.slots = nn.Parameter(torch.randn(num_slots, hidden_dim) * 0.02)
         self.encoder_blocks = nn.ModuleList(
             [SetVQEncoderBlock(hidden_dim, num_heads, dropout) for _ in range(encoder_layers)]
@@ -316,13 +330,14 @@ class SetVQSpectrumTokenizer(nn.Module):
         self.to_code = _mlp(hidden_dim, hidden_dim, code_dim, 2, dropout, normalize_output=True)
         self.vq = VectorQuantizer(codebook_size, code_dim, beta=beta)
 
-        decoder_input_dim = num_slots * code_dim + condition_dim
-        self.decoder = _mlp(decoder_input_dim, hidden_dim, num_bins * 2, decoder_layers, dropout)
+        decoder_input_dim = code_dim + condition_dim + hidden_dim
+        self.slot_decoder = _mlp(decoder_input_dim, hidden_dim, num_bins * 2, decoder_layers, dropout)
 
     def config_dict(self) -> dict:
         return {
             "peak_dim": self.peak_dim,
             "condition_dim": self.condition_dim,
+            "formula_dim": self.formula_dim,
             "hidden_dim": self.hidden_dim,
             "code_dim": self.code_dim,
             "codebook_size": self.codebook_size,
@@ -336,12 +351,26 @@ class SetVQSpectrumTokenizer(nn.Module):
             "bce_weight": self.bce_weight,
             "intensity_weight": self.intensity_weight,
             "cosine_weight": self.cosine_weight,
+            "diversity_weight": self.diversity_weight,
+            "slot_usage_weight": self.slot_usage_weight,
+            "formula_conditioned": self.formula_conditioned,
         }
+
+    def formula_embedding(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        if self.formula_conditioned:
+            formula_in = torch.cat([batch["formula_x"], batch["parent_mass"], batch["precursor_mz"]], dim=-1)
+            return self.formula_encoder(formula_in)
+        batch_size = batch["peak_x"].shape[0]
+        return torch.zeros(batch_size, self.hidden_dim, device=batch["peak_x"].device, dtype=batch["peak_x"].dtype)
 
     def encode_slots(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         memory = self.peak_encoder(batch["peak_x"])
         peak_mask = batch["peak_mask"].bool()
+        formula_emb = self.formula_embedding(batch)
         slots = self.slots.unsqueeze(0).expand(memory.shape[0], -1, -1)
+        if self.formula_conditioned:
+            bias = self.formula_slot_bias(formula_emb).view(memory.shape[0], self.num_slots, self.hidden_dim)
+            slots = slots + bias
         for block in self.encoder_blocks:
             slots = block(slots, memory, peak_mask)
         return self.to_code(slots)
@@ -355,12 +384,19 @@ class SetVQSpectrumTokenizer(nn.Module):
         target_intensity = batch["target_intensity"]
 
         vq = self.vq(self.encode_slots(batch))
-        decoder_in = torch.cat([vq.quantized.reshape(vq.quantized.shape[0], -1), cond], dim=-1)
-        decoded = self.decoder(decoder_in)
-        presence_logits, intensity_logits = decoded.chunk(2, dim=-1)
-        presence_prob = torch.sigmoid(presence_logits)
-        intensity_pred = torch.sigmoid(intensity_logits)
-        binned_recon = presence_prob * intensity_pred
+        formula_emb = self.formula_embedding(batch)
+        cond_slots = cond.unsqueeze(1).expand(-1, self.num_slots, -1)
+        formula_slots = formula_emb.unsqueeze(1).expand(-1, self.num_slots, -1)
+        decoder_in = torch.cat([vq.quantized, cond_slots, formula_slots], dim=-1)
+        decoded = self.slot_decoder(decoder_in)
+        slot_presence_logits, slot_intensity_logits = decoded.chunk(2, dim=-1)
+        slot_presence_prob = torch.sigmoid(slot_presence_logits)
+        slot_intensity_pred = torch.sigmoid(slot_intensity_logits)
+        slot_contrib = slot_presence_prob * slot_intensity_pred
+        presence_prob = 1.0 - torch.prod(1.0 - slot_presence_prob.clamp(0.0, 0.999), dim=1)
+        presence_logits = torch.logit(presence_prob.clamp(1e-6, 1.0 - 1e-6))
+        intensity_pred = torch.clamp(slot_contrib.sum(dim=1), 0.0, 1.0)
+        binned_recon = intensity_pred
 
         pos = target_presence.sum().clamp_min(1.0)
         neg = (target_presence.numel() - target_presence.sum()).clamp_min(1.0)
@@ -374,10 +410,23 @@ class SetVQSpectrumTokenizer(nn.Module):
         intensity_loss = ((intensity_pred - target_intensity).pow(2) * intensity_weights).mean()
         cosine = F.cosine_similarity(binned_recon, target_intensity, dim=-1, eps=1e-8)
         spectral_cosine_loss = 1.0 - cosine.mean()
+        slot_z = F.normalize(vq.quantized, dim=-1)
+        slot_sim = torch.matmul(slot_z, slot_z.transpose(1, 2))
+        eye = torch.eye(self.num_slots, device=slot_sim.device, dtype=torch.bool).unsqueeze(0)
+        diversity_loss = slot_sim.masked_fill(eye, 0.0).pow(2).sum() / (
+            slot_sim.shape[0] * self.num_slots * max(self.num_slots - 1, 1)
+        )
+        contrib_norm = F.normalize(slot_contrib + 1e-8, dim=-1)
+        contrib_sim = torch.matmul(contrib_norm, contrib_norm.transpose(1, 2))
+        slot_usage_loss = contrib_sim.masked_fill(eye, 0.0).pow(2).sum() / (
+            contrib_sim.shape[0] * self.num_slots * max(self.num_slots - 1, 1)
+        )
         recon_loss = (
             self.bce_weight * bce_loss
             + self.intensity_weight * intensity_loss
             + self.cosine_weight * spectral_cosine_loss
+            + self.diversity_weight * diversity_loss
+            + self.slot_usage_weight * slot_usage_loss
         )
         loss = recon_loss + vq.loss
 
@@ -388,10 +437,15 @@ class SetVQSpectrumTokenizer(nn.Module):
             "bce_loss": bce_loss.detach(),
             "intensity_loss": intensity_loss.detach(),
             "spectral_cosine_loss": spectral_cosine_loss.detach(),
+            "slot_diversity_loss": diversity_loss.detach(),
+            "slot_usage_loss": slot_usage_loss.detach(),
             "presence_logits": presence_logits,
             "presence_prob": presence_prob,
             "intensity_pred": intensity_pred,
             "binned_recon": binned_recon,
+            "slot_presence_logits": slot_presence_logits,
+            "slot_intensity_pred": slot_intensity_pred,
+            "slot_contrib": slot_contrib,
             "slot_codes": vq.codes,
             "code_perplexity": vq.perplexity,
             "code_entropy": vq.entropy,
@@ -431,3 +485,39 @@ def initialize_setvq_codebook_from_loader(
     if noise_std > 0:
         values = F.normalize(values + torch.randn_like(values) * noise_std, dim=-1)
     model.vq.embedding.weight.copy_(values)
+
+
+@torch.no_grad()
+def refresh_dead_setvq_codes(
+    model: SetVQSpectrumTokenizer,
+    loader,
+    *,
+    used_codes: set[int],
+    device: torch.device,
+    num_batches: int = 8,
+    noise_std: float = 1e-3,
+) -> int:
+    """Replace unused SetVQ codes with current encoder states."""
+
+    dead = [idx for idx in range(model.codebook_size) if idx not in used_codes]
+    if not dead:
+        return 0
+    model.eval()
+    chunks = []
+    for batch_idx, batch in enumerate(loader):
+        if batch_idx >= num_batches:
+            break
+        batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+        chunks.append(F.normalize(model.encode_slots(batch), dim=-1).reshape(-1, model.code_dim))
+    if not chunks:
+        return 0
+    z = torch.cat(chunks, dim=0)
+    if z.shape[0] == 0:
+        return 0
+    dead_tensor = torch.tensor(dead, dtype=torch.long, device=device)
+    choice = torch.randint(0, z.shape[0], (len(dead),), device=device)
+    values = z[choice]
+    if noise_std > 0:
+        values = F.normalize(values + torch.randn_like(values) * noise_std, dim=-1)
+    model.vq.embedding.weight[dead_tensor] = values
+    return len(dead)

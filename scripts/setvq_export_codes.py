@@ -46,8 +46,11 @@ def main() -> None:
     args = parse_args()
     device = _device(args.device)
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    feature_config = SpectrumFeatureConfig(**checkpoint["feature_config"])
-    model = SetVQSpectrumTokenizer(**checkpoint["model_config"]).to(device)
+    model_config = dict(checkpoint["model_config"])
+    feature_config_raw = dict(checkpoint["feature_config"])
+    feature_config_raw.setdefault("formula_conditioned", bool(model_config.get("formula_conditioned", model_config.get("peak_dim", 3) > 3)))
+    feature_config = SpectrumFeatureConfig(**feature_config_raw)
+    model = SetVQSpectrumTokenizer(**model_config).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
 
@@ -83,7 +86,8 @@ def main() -> None:
         "layout": "setvq_slot_hist",
         "codebook_size": int(model.codebook_size),
         "num_slots": int(model.num_slots),
-        "feature_config": checkpoint["feature_config"],
+        "formula_conditioned": bool(model.formula_conditioned),
+        "feature_config": feature_config_raw,
     }
     out.with_suffix(".json").write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(meta, indent=2, sort_keys=True))

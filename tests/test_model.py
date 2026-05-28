@@ -1,6 +1,12 @@
 import torch
 
-from vqfrag.model import SetVQSpectrumTokenizer, VQFragmentTokenizer, entropy_regularizer, setvq_entropy_regularizer
+from vqfrag.model import (
+    SetVQSpectrumTokenizer,
+    VQFragmentTokenizer,
+    entropy_regularizer,
+    refresh_dead_setvq_codes,
+    setvq_entropy_regularizer,
+)
 
 
 def test_vq_fragment_tokenizer_forward_shapes():
@@ -25,6 +31,7 @@ def test_vq_fragment_tokenizer_forward_shapes():
 
 def test_setvq_spectrum_tokenizer_forward_and_backward():
     model = SetVQSpectrumTokenizer(
+        peak_dim=5,
         hidden_dim=32,
         code_dim=8,
         codebook_size=16,
@@ -34,7 +41,7 @@ def test_setvq_spectrum_tokenizer_forward_and_backward():
         encoder_layers=1,
     )
     batch = {
-        "peak_x": torch.rand(3, 5, 3),
+        "peak_x": torch.rand(3, 5, 5),
         "peak_mask": torch.tensor(
             [
                 [True, True, True, False, False],
@@ -42,6 +49,9 @@ def test_setvq_spectrum_tokenizer_forward_and_backward():
                 [True, True, True, True, False],
             ]
         ),
+        "formula_x": torch.rand(3, 18),
+        "parent_mass": torch.rand(3, 1),
+        "precursor_mz": torch.rand(3, 1),
         "cond_x": torch.rand(3, 12),
         "target_presence": torch.zeros(3, 21),
         "target_intensity": torch.zeros(3, 21),
@@ -52,8 +62,34 @@ def test_setvq_spectrum_tokenizer_forward_and_backward():
     outputs = model(batch)
 
     assert outputs["slot_codes"].shape == (3, 4)
+    assert outputs["slot_presence_logits"].shape == (3, 4, 21)
     assert outputs["binned_recon"].shape == (3, 21)
     assert outputs["presence_logits"].shape == (3, 21)
     assert outputs["loss"].ndim == 0
     assert setvq_entropy_regularizer(outputs, model.codebook_size).ndim == 0
     outputs["loss"].backward()
+
+
+def test_refresh_dead_setvq_codes_executes():
+    model = SetVQSpectrumTokenizer(
+        peak_dim=5,
+        hidden_dim=32,
+        code_dim=8,
+        codebook_size=8,
+        num_slots=2,
+        num_bins=11,
+        num_heads=4,
+        encoder_layers=1,
+    )
+    batch = {
+        "peak_x": torch.rand(2, 4, 5),
+        "peak_mask": torch.ones(2, 4, dtype=torch.bool),
+        "formula_x": torch.rand(2, 18),
+        "parent_mass": torch.rand(2, 1),
+        "precursor_mz": torch.rand(2, 1),
+        "cond_x": torch.rand(2, 12),
+        "target_presence": torch.zeros(2, 11),
+        "target_intensity": torch.zeros(2, 11),
+    }
+    refreshed = refresh_dead_setvq_codes(model, [batch], used_codes={0, 1}, device=torch.device("cpu"), num_batches=1)
+    assert refreshed == 6

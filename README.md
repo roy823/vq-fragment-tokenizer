@@ -62,17 +62,18 @@ bin presence. The main question is whether `vq` beats `peak_stats`, and whether
 compressing simple peak statistics rather than learning a useful fragmentation
 vocabulary.
 
-## Observation-Only SetVQ
+## Formula-Conditioned SetVQ
 
-This is the Step-1 spectrum-level route. It trains only from observed spectrum
-inputs: `mz`, `intensity`, collision energy, adduct condition, and instrument
-condition. Root formula, fragment formula, neutral loss, and m/z error are not
-fed to the model.
+This is the Step-1b spectrum-level route. It uses root formula as a legal
+global condition, plus observed spectrum inputs: `mz`, `intensity`, collision
+energy, observed loss mass derived from formula and m/z, adduct condition, and
+instrument condition. Fragment formula, neutral-loss formula, peak-formula
+assignment, DAG labels, and m/z error are not fed to the model.
 
 ```powershell
 python scripts/setvq_train.py `
   --index data\canopus_hplus_50k_units.jsonl `
-  --out-dir runs\canopus_setvq_obs_k256 `
+  --out-dir runs\canopus_setvq_formula_k256 `
   --epochs 10 `
   --batch-size 128 `
   --codebook-size 256 `
@@ -80,19 +81,22 @@ python scripts/setvq_train.py `
 
 python scripts/setvq_report.py `
   --index data\canopus_hplus_50k_units.jsonl `
-  --checkpoint runs\canopus_setvq_obs_k256\best_model.pt `
-  --out-dir runs\canopus_setvq_obs_k256\report
+  --checkpoint runs\canopus_setvq_formula_k256\best_model.pt `
+  --out-dir runs\canopus_setvq_formula_k256\report
 
 python scripts/setvq_export_codes.py `
   --index data\canopus_hplus_50k_units.jsonl `
-  --checkpoint runs\canopus_setvq_obs_k256\best_model.pt `
-  --out runs\canopus_setvq_obs_k256\setvq_code_histograms.npz
+  --checkpoint runs\canopus_setvq_formula_k256\best_model.pt `
+  --out runs\canopus_setvq_formula_k256\setvq_code_histograms.npz
 
 python scripts/vq_probe.py `
-  --features runs\canopus_setvq_obs_k256\setvq_code_histograms.npz `
+  --features runs\canopus_setvq_formula_k256\setvq_code_histograms.npz `
   --index data\canopus_hplus_50k_units.jsonl `
-  --out-dir runs\canopus_setvq_obs_k256\probe
+  --out-dir runs\canopus_setvq_formula_k256\probe
 ```
+
+Pass `--no-formula-conditioned` to `setvq_train.py` to reproduce the earlier
+observation-only ablation.
 
 For a smoke run:
 

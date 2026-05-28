@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -77,6 +78,16 @@ def _code_histogram(codes: np.ndarray, codebook_size: int) -> np.ndarray:
     return counts / max(float(counts.sum()), 1.0)
 
 
+def _entropy_fraction(values: np.ndarray) -> float:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    total = arr.sum()
+    if total <= 0:
+        return 0.0
+    probs = arr / total
+    probs = probs[probs > 0]
+    return float(-(probs * np.log(probs)).sum() / np.log(max(len(arr), 2)))
+
+
 def _nearest_neighbors(names: list[str], hist: np.ndarray, max_items: int) -> list[dict]:
     n = min(len(names), max_items)
     if n <= 1:
@@ -103,8 +114,11 @@ def main() -> None:
     device = _device(args.device)
 
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    feature_config = SpectrumFeatureConfig(**checkpoint["feature_config"])
-    model = SetVQSpectrumTokenizer(**checkpoint["model_config"]).to(device)
+    model_config = dict(checkpoint["model_config"])
+    feature_config_raw = dict(checkpoint["feature_config"])
+    feature_config_raw.setdefault("formula_conditioned", bool(model_config.get("formula_conditioned", model_config.get("peak_dim", 3) > 3)))
+    feature_config = SpectrumFeatureConfig(**feature_config_raw)
+    model = SetVQSpectrumTokenizer(**model_config).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
 
@@ -123,6 +137,8 @@ def main() -> None:
     bin_recalls = []
     names = []
     histograms = []
+    slot_diversities = []
+    slot_contribution_entropies = []
     rng = np.random.default_rng(0)
     with torch.no_grad():
         for batch in loader:
@@ -130,6 +146,7 @@ def main() -> None:
             outputs = model(tensor_batch)
             codes = outputs["slot_codes"].detach().cpu().numpy()
             recon = outputs["binned_recon"].detach().cpu().numpy()
+            slot_contrib = outputs["slot_contrib"].detach().cpu().numpy()
             target = batch["target_intensity"].detach().cpu().numpy()
             presence = batch["target_presence"].detach().cpu().numpy()
 
@@ -152,6 +169,10 @@ def main() -> None:
                 bin_recalls.append(_bin_recall(pres, pred_bins))
                 names.append(spec_id)
                 histograms.append(_code_histogram(row_codes, model.codebook_size))
+                slot_counts = Counter(int(code) for code in row_codes.reshape(-1))
+                slot_diversities.append(len(slot_counts) / max(model.num_slots, 1))
+            slot_mass = slot_contrib.sum(axis=2)
+            slot_contribution_entropies.extend([_entropy_fraction(row) for row in slot_mass])
 
     codes_arr = np.concatenate(all_codes) if all_codes else np.array([], dtype=np.int64)
     usage = code_usage_stats(codes_arr, model.codebook_size)
@@ -164,6 +185,9 @@ def main() -> None:
         "num_bins": int(model.num_bins),
         "feature_config": checkpoint["feature_config"],
         "usage": usage,
+        "avg_nonzero_codes_per_spectrum": float((hist_arr > 0).sum(axis=1).mean()) if hist_arr.size else 0.0,
+        "slot_diversity_mean": float(np.mean(slot_diversities)) if slot_diversities else 0.0,
+        "slot_contribution_entropy_mean": float(np.mean(slot_contribution_entropies)) if slot_contribution_entropies else 0.0,
         "reconstruction": {
             "binned_spectral_cosine_mean": float(np.mean(cosines)) if cosines else 0.0,
             "binned_spectral_cosine_median": float(np.median(cosines)) if cosines else 0.0,
@@ -178,6 +202,8 @@ def main() -> None:
         "criterion_perplexity_fraction_min": 0.20,
         "criterion_pass": {
             "code_perplexity_fraction": usage["perplexity_fraction"] >= 0.20,
+            "active_codes_ge_50": usage["active_codes"] >= 50,
+            "avg_nonzero_codes_gt_3": (float((hist_arr > 0).sum(axis=1).mean()) if hist_arr.size else 0.0) > 3.0,
             "beats_random_cosine": (float(np.mean(cosines)) if cosines else 0.0)
             > (float(np.mean(random_cosines)) if random_cosines else 0.0),
         },
@@ -195,14 +221,20 @@ def main() -> None:
         f"- Codebook size: {model.codebook_size}",
         f"- Slots per spectrum: {model.num_slots}",
         f"- Bins: {model.num_bins} at width {feature_config.bin_width}",
-        "- Inputs: mz, intensity, collision energy, adduct condition, instrument condition",
-        "- Excluded from model input: root formula, fragment formula, neutral loss, mz error",
+        f"- Formula conditioned: {model.formula_conditioned}",
+        "- Inputs: mz, intensity, collision energy, observed loss mass, relative precursor m/z, adduct/instrument condition, optional root formula condition",
+        "- Excluded from model input: fragment formula, neutral-loss formula, peak-formula assignment, mz error",
         "",
         "## Code Usage",
         "",
-        "| Active fraction | Perplexity fraction | Criterion >= 0.20 |",
-        "|---:|---:|---:|",
-        f"| {usage['active_fraction']:.3f} | {usage['perplexity_fraction']:.3f} | {report['criterion_pass']['code_perplexity_fraction']} |",
+        "| Active codes | Active fraction | Perplexity fraction | Avg nonzero/spectrum | Criterion >= 0.20 |",
+        "|---:|---:|---:|---:|---:|",
+        f"| {usage['active_codes']} | {usage['active_fraction']:.3f} | {usage['perplexity_fraction']:.3f} | {report['avg_nonzero_codes_per_spectrum']:.3f} | {report['criterion_pass']['code_perplexity_fraction']} |",
+        "",
+        "## Slot Behavior",
+        "",
+        f"- Mean within-spectrum unique-code fraction: {report['slot_diversity_mean']:.4f}",
+        f"- Mean slot contribution entropy fraction: {report['slot_contribution_entropy_mean']:.4f}",
         "",
         "## Reconstruction",
         "",

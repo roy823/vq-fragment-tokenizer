@@ -19,7 +19,12 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from vqfrag.data import SpectrumFeatureConfig, SpectrumSetDataset, collate_spectrum_sets
 from vqfrag.metrics import code_usage_stats
-from vqfrag.model import SetVQSpectrumTokenizer, initialize_setvq_codebook_from_loader, setvq_entropy_regularizer
+from vqfrag.model import (
+    SetVQSpectrumTokenizer,
+    initialize_setvq_codebook_from_loader,
+    refresh_dead_setvq_codes,
+    setvq_entropy_regularizer,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-peaks", type=int, default=256)
     parser.add_argument("--max-mz", type=float, default=1500.0)
     parser.add_argument("--bin-width", type=float, default=1.0)
+    parser.add_argument("--formula-conditioned", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -43,10 +49,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decoder-layers", type=int, default=3)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.0)
-    parser.add_argument("--entropy-weight", type=float, default=0.02)
+    parser.add_argument("--entropy-weight", type=float, default=0.08)
     parser.add_argument("--init-codebook", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--init-batches", type=int, default=4)
     parser.add_argument("--refresh-codebook-each-epoch", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--refresh-dead-codes-each-epoch", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--dead-code-refresh-batches", type=int, default=8)
     parser.add_argument("--val-fraction", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
@@ -81,6 +89,8 @@ def _epoch(
         "bce_loss": 0.0,
         "intensity_loss": 0.0,
         "spectral_cosine_loss": 0.0,
+        "slot_diversity_loss": 0.0,
+        "slot_usage_loss": 0.0,
         "n": 0,
     }
     all_codes = []
@@ -98,7 +108,15 @@ def _epoch(
         batch_n = int(batch["peak_x"].shape[0])
         totals["loss"] += float(loss.detach().cpu()) * batch_n
         totals["raw_loss"] += float(outputs["loss"].detach().cpu()) * batch_n
-        for key in ["recon_loss", "vq_loss", "bce_loss", "intensity_loss", "spectral_cosine_loss"]:
+        for key in [
+            "recon_loss",
+            "vq_loss",
+            "bce_loss",
+            "intensity_loss",
+            "spectral_cosine_loss",
+            "slot_diversity_loss",
+            "slot_usage_loss",
+        ]:
             totals[key] += float(outputs[key].detach().cpu()) * batch_n
         totals["n"] += batch_n
         all_codes.append(outputs["slot_codes"].detach().cpu().numpy().reshape(-1))
@@ -108,6 +126,8 @@ def _epoch(
     usage = code_usage_stats(np.concatenate(all_codes), model.codebook_size) if all_codes else {}
     metrics["code_active_fraction"] = usage.get("active_fraction", 0.0)
     metrics["code_perplexity_fraction"] = usage.get("perplexity_fraction", 0.0)
+    metrics["code_counts"] = usage.get("counts", [])
+    metrics["used_codes"] = [idx for idx, count in enumerate(metrics["code_counts"]) if count > 0]
     return metrics
 
 
@@ -125,6 +145,8 @@ def main() -> None:
         max_mz=args.max_mz,
         bin_width=args.bin_width,
         mz_scale=args.max_mz,
+        mass_scale=args.max_mz,
+        formula_conditioned=args.formula_conditioned,
     )
     dataset = SpectrumSetDataset(
         args.index,
@@ -157,6 +179,7 @@ def main() -> None:
 
     device = _device(args.device)
     model = SetVQSpectrumTokenizer(
+        peak_dim=5 if args.formula_conditioned else 3,
         hidden_dim=args.hidden_dim,
         code_dim=args.code_dim,
         codebook_size=args.codebook_size,
@@ -166,6 +189,7 @@ def main() -> None:
         decoder_layers=args.decoder_layers,
         num_heads=args.num_heads,
         dropout=args.dropout,
+        formula_conditioned=args.formula_conditioned,
     ).to(device)
     if args.init_codebook:
         initialize_setvq_codebook_from_loader(model, train_loader, device=device, num_batches=args.init_batches)
@@ -181,6 +205,15 @@ def main() -> None:
             device=device,
             entropy_weight=args.entropy_weight,
         )
+        refreshed_dead_codes = 0
+        if args.refresh_dead_codes_each_epoch:
+            refreshed_dead_codes = refresh_dead_setvq_codes(
+                model,
+                train_loader,
+                used_codes=set(train_metrics.get("used_codes", [])),
+                device=device,
+                num_batches=args.dead_code_refresh_batches,
+            )
         if args.refresh_codebook_each_epoch:
             initialize_setvq_codebook_from_loader(model, train_loader, device=device, num_batches=args.init_batches)
         with torch.no_grad():
@@ -191,7 +224,7 @@ def main() -> None:
                 device=device,
                 entropy_weight=args.entropy_weight,
             )
-        entry = {"epoch": epoch, "train": train_metrics, "val": val_metrics}
+        entry = {"epoch": epoch, "train": train_metrics, "val": val_metrics, "refreshed_dead_codes": refreshed_dead_codes}
         history.append(entry)
         print(json.dumps(entry, sort_keys=True))
 

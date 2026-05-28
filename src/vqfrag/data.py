@@ -464,6 +464,7 @@ class SpectrumSetRecord:
     """Observation-only spectrum record aggregated by ``spectrum_id``."""
 
     spectrum_id: str
+    root_formula: str
     adduct: str
     collision_energy: float | None
     instrument: str | None
@@ -476,7 +477,9 @@ class SpectrumFeatureConfig:
     max_mz: float = 1500.0
     bin_width: float = 1.0
     mz_scale: float = 1500.0
+    mass_scale: float = 1500.0
     ce_scale: float = 100.0
+    formula_conditioned: bool = True
 
     @property
     def num_bins(self) -> int:
@@ -504,6 +507,7 @@ def read_spectrum_set_records(
                 if max_spectra is not None and len(meta) >= max_spectra:
                     continue
                 meta[spec_id] = {
+                    "root_formula": str(data.get("root_formula") or ""),
                     "adduct": str(data.get("adduct") or ""),
                     "collision_energy": data.get("collision_energy"),
                     "instrument": data.get("instrument"),
@@ -524,6 +528,7 @@ def read_spectrum_set_records(
         records.append(
             SpectrumSetRecord(
                 spectrum_id=spec_id,
+                root_formula=meta[spec_id]["root_formula"],
                 adduct=normalize_ion(meta[spec_id]["adduct"]) or "",
                 collision_energy=None if ce_raw is None else float(ce_raw),
                 instrument=meta[spec_id]["instrument"],
@@ -553,14 +558,38 @@ def spectrum_to_features(
     record: SpectrumSetRecord,
     config: SpectrumFeatureConfig = SpectrumFeatureConfig(),
 ) -> dict[str, np.ndarray]:
-    """Map one whole-spectrum record to observation-only SetVQ features."""
+    """Map one whole-spectrum record to SetVQ features.
+
+    Formula-conditioned mode may use root formula, parent mass, precursor m/z,
+    and observed loss mass derived from observed m/z. It never uses peak formula,
+    fragment formula, neutral-loss formula, or DAG labels.
+    """
 
     selected = list(record.peaks[: config.max_peaks])
-    peak_x = np.zeros((config.max_peaks, 3), dtype=np.float32)
+    peak_dim = 5 if config.formula_conditioned else 3
+    peak_x = np.zeros((config.max_peaks, peak_dim), dtype=np.float32)
     peak_mask = np.zeros(config.max_peaks, dtype=np.bool_)
     ce_norm = 0.0 if record.collision_energy is None else float(record.collision_energy) / config.ce_scale
+    try:
+        formula_vec = formula_to_vector(record.root_formula).astype(np.float32)
+        parent_mass = formula_mass(formula_vec)
+    except ValueError:
+        formula_vec = np.zeros(len(NORM_VEC), dtype=np.float32)
+        parent_mass = 0.0
+    try:
+        shift = ion_mass_shift(record.adduct)
+    except ValueError:
+        shift = 0.0
+    precursor_mz = parent_mass + shift if parent_mass > 0 else 0.0
     for idx, (mz, inten) in enumerate(selected):
-        peak_x[idx] = np.array([float(mz) / config.mz_scale, float(inten), ce_norm], dtype=np.float32)
+        mz_norm = float(mz) / config.mz_scale
+        base = [mz_norm, float(inten), ce_norm]
+        if config.formula_conditioned:
+            neutral_peak_mass = max(float(mz) - shift, 0.0)
+            observed_loss_mass = max(parent_mass - neutral_peak_mass, 0.0) if parent_mass > 0 else 0.0
+            rel_mz = float(mz) / precursor_mz if precursor_mz > 0 else 0.0
+            base.extend([observed_loss_mass / config.mass_scale, rel_mz])
+        peak_x[idx] = np.array(base, dtype=np.float32)
         peak_mask[idx] = True
 
     adduct_idx = ION_TO_INDEX.get(record.adduct, -1)
@@ -575,6 +604,9 @@ def spectrum_to_features(
     return {
         "peak_x": peak_x,
         "peak_mask": peak_mask,
+        "formula_x": (formula_vec / NORM_VEC).astype(np.float32),
+        "parent_mass": np.array([parent_mass / config.mass_scale], dtype=np.float32),
+        "precursor_mz": np.array([precursor_mz / config.mz_scale], dtype=np.float32),
         "cond_x": cond_x,
         "target_presence": target_presence,
         "target_intensity": target_intensity,
@@ -613,6 +645,9 @@ class SpectrumSetDataset(Dataset):
         return {
             "peak_x": torch.from_numpy(feats["peak_x"]),
             "peak_mask": torch.from_numpy(feats["peak_mask"]),
+            "formula_x": torch.from_numpy(feats["formula_x"]),
+            "parent_mass": torch.from_numpy(feats["parent_mass"]),
+            "precursor_mz": torch.from_numpy(feats["precursor_mz"]),
             "cond_x": torch.from_numpy(feats["cond_x"]),
             "target_presence": torch.from_numpy(feats["target_presence"]),
             "target_intensity": torch.from_numpy(feats["target_intensity"]),
@@ -622,7 +657,16 @@ class SpectrumSetDataset(Dataset):
 
 
 def collate_spectrum_sets(batch: list[dict]) -> dict:
-    tensor_keys = ["peak_x", "peak_mask", "cond_x", "target_presence", "target_intensity"]
+    tensor_keys = [
+        "peak_x",
+        "peak_mask",
+        "formula_x",
+        "parent_mass",
+        "precursor_mz",
+        "cond_x",
+        "target_presence",
+        "target_intensity",
+    ]
     out = {key: torch.stack([item[key] for item in batch], dim=0) for key in tensor_keys}
     out["spectrum_id"] = [item["spectrum_id"] for item in batch]
     out["peaks"] = [item["peaks"] for item in batch]

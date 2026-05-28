@@ -119,14 +119,20 @@ def test_spectrum_set_dataset_is_observation_only(tmp_path):
     assert set(batch) == {
         "peak_x",
         "peak_mask",
+        "formula_x",
+        "parent_mass",
+        "precursor_mz",
         "cond_x",
         "target_presence",
         "target_intensity",
         "spectrum_id",
         "peaks",
     }
-    assert batch["peak_x"].shape == (1, 4, 3)
+    assert batch["peak_x"].shape == (1, 4, 5)
     assert batch["peak_mask"].tolist() == [[True, True, False, False]]
+    assert batch["formula_x"].shape == (1, 18)
+    assert batch["parent_mass"].shape == (1, 1)
+    assert batch["precursor_mz"].shape == (1, 1)
     assert batch["target_presence"].shape == (1, 201)
     assert batch["target_presence"][0, 55] == 1.0
     assert batch["target_presence"][0, 100] == 1.0
