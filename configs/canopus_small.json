@@ -1,0 +1,22 @@
+{
+  "frigid_root": "../FRIGID/FRIGID-main",
+  "index": "data/canopus_hplus_peak_units.jsonl",
+  "audit": {
+    "include_real": true,
+    "include_aug": true,
+    "max_real_files": null,
+    "max_aug_files": 5000,
+    "max_peaks": 100,
+    "min_intensity": 0.0,
+    "require_hplus": true
+  },
+  "train": {
+    "max_records": 200000,
+    "epochs": 5,
+    "batch_size": 512,
+    "hidden_dim": 128,
+    "code_dim": 64,
+    "codebook_size": 128,
+    "entropy_weight": 0.02
+  }
+}
